@@ -1,0 +1,1 @@
+{"opacity": 1.0, "size": 150, "vpn_interface": "tun0", "game_mode": true, "modules": {"show_info": true, "show_cpu": true, "show_ram": true, "show_disk": true, "show_temp": true, "show_net": true}, "theme": "purple"}
