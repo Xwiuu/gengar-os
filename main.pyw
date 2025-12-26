@@ -6,8 +6,8 @@ import subprocess
 import platform
 import time
 import requests
+import socket
 
-# --- IMPORTAÇÃO SEGURA ---
 try:
     from PyQt6.QtWidgets import (
         QApplication,
@@ -29,27 +29,9 @@ try:
         QFrame,
     )
     from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QSize
-    from PyQt6.QtGui import QMovie, QAction, QIcon, QPixmap
+    from PyQt6.QtGui import QMovie, QAction, QIcon, QPixmap, QColor
 except ImportError:
     sys.exit(1)
-
-# Hardware Libs
-HAS_WMI = False
-HAS_GPU = False
-try:
-    import wmi
-    import pythoncom
-
-    HAS_WMI = True
-except ImportError:
-    pass
-
-try:
-    import GPUtil
-
-    HAS_GPU = True
-except ImportError:
-    pass
 
 CONFIG_FILE = "config.json"
 DEFAULT_CONFIG = {
@@ -57,6 +39,7 @@ DEFAULT_CONFIG = {
     "size": 170,
     "game_mode": False,
     "theme": "purple",
+    "auto_game": True,
     "modules": {
         "show_cpu": True,
         "show_ram": True,
@@ -73,6 +56,22 @@ THEMES = {
     "blue": {"main": "#00ccff", "acc": "#00ffff", "bg": "rgba(10, 15, 30, 0.95)"},
     "red": {"main": "#ff0000", "acc": "#ff4444", "bg": "rgba(20, 10, 10, 0.95)"},
 }
+
+GAMES_LIST = [
+    "cs2.exe",
+    "csgo.exe",
+    "valorant.exe",
+    "valorant-win64-shipping.exe",
+    "league of legends.exe",
+    "dota2.exe",
+    "gta5.exe",
+    "r5apex.exe",
+    "fortniteclient-win64-shipping.exe",
+    "minecraft.exe",
+    "robloxplayerbeta.exe",
+    "cod.exe",
+    "overwatch.exe",
+]
 
 
 def get_stylesheet(theme_name):
@@ -110,108 +109,217 @@ def get_cpu_info():
         return "CPU Genérica"
 
 
-class DataWorker(QThread):
+def get_temp_color(temp_str):
+    if "--" in temp_str or "N/A" in temp_str:
+        return "#00ff00"
+    try:
+        temp = float(temp_str.replace("°C", ""))
+        if temp < 45:
+            return "#00ffff"
+        if temp < 65:
+            return "#00ff00"
+        if temp < 80:
+            return "#ffff00"
+        if temp < 90:
+            return "#ff8800"
+        return "#ff0000"
+    except:
+        return "#00ff00"
+
+
+# --- WORKER INTELIGENTE V32 ---
+class FastWorker(QThread):
     data_ready = pyqtSignal(dict)
 
     def __init__(self):
         super().__init__()
         self.running = True
+        self.found_ip = None
+
+    def find_monitor_ip(self):
+        # Tenta descobrir onde o LibreMonitor está rodando
+        ips = ["127.0.0.1", "localhost"]
+        try:
+            # Pega todos os IPs da máquina
+            host_name = socket.gethostname()
+            for ip in socket.gethostbyname_ex(host_name)[2]:
+                ips.append(ip)
+        except:
+            pass
+
+        # Testa qual responde
+        for ip in ips:
+            try:
+                url = f"http://{ip}:8085/data.json"
+                r = requests.get(url, timeout=0.2)
+                if r.status_code == 200:
+                    return url
+            except:
+                pass
+        return None
+
+    def parse_hardware_json(self, data, d):
+        for item in data:
+            txt = item.get("Text", "")
+            image = item.get("ImageURL", "")
+            children = item.get("Children", [])
+
+            # --- LÓGICA DE TEMPERATURA ---
+            # Procura sensores de temperatura
+            if "Temperature" in item.get("Type", "") or "Temperature" in txt:
+                try:
+                    val_clean = item["Value"].replace(" °C", "").replace(",", ".")
+                    val = float(val_clean)
+
+                    # FILTRO DE REALIDADE:
+                    # Ignora se for menor que 20°C (Provavelmente é "Distance to TjMax" ou erro)
+                    # Ignora se tiver "Distance" no nome
+                    if val > 20 and "distance" not in txt.lower():
+                        # Prioriza Package ou Core Max
+                        if "package" in txt.lower() or "max" in txt.lower():
+                            d["temp"] = f"{val:.0f}°C"
+                        # Se ainda não tem nada, pega o primeiro que achar válido
+                        elif d["temp"] == "--":
+                            d["temp"] = f"{val:.0f}°C"
+                except:
+                    pass
+
+            # --- LÓGICA DE GPU ---
+            is_gpu_section = (
+                "nvidia" in txt.lower()
+                or "amd" in txt.lower()
+                or "geforce" in txt.lower()
+                or "radeon" in txt.lower()
+            )
+
+            # Se for GPU, olha dentro
+            if is_gpu_section and children:
+                self.parse_gpu_children(children, d)
+
+            # Recursão para achar a seção certa
+            if children:
+                self.parse_hardware_json(children, d)
+
+    def parse_gpu_children(self, nodes, d):
+        for s in nodes:
+            txt = s.get("Text", "")
+            val_str = s.get("Value", "0")
+            type_ = s.get("Type", "")
+
+            # Load
+            if "Load" in type_ or "Load" in txt:
+                if "Core" in txt or "GPU" in txt:
+                    try:
+                        val = float(val_str.replace(" %", "").replace(",", "."))
+                        if val > d["gpu_load"]:
+                            d["gpu_load"] = int(val)
+                    except:
+                        pass
+
+            # Temp GPU
+            if "Temperature" in type_ or "Temperature" in txt:
+                if "Core" in txt or "GPU" in txt:
+                    try:
+                        val = float(val_str.replace(" °C", "").replace(",", "."))
+                        if val > 0:
+                            d["gpu_temp"] = f"{val:.0f}°C"
+                    except:
+                        pass
+
+            if s.get("Children"):
+                self.parse_gpu_children(s["Children"], d)
 
     def run(self):
-        if HAS_WMI:
-            pythoncom.CoInitialize()
-
         while self.running:
-            d = {}
-            # Ping
+            d = {"ping": "--", "temp": "--", "gpu_load": 0, "gpu_temp": None}
+
+            # PING
             try:
-                si = subprocess.STARTUPINFO()
-                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                out = subprocess.check_output(
-                    "ping -n 1 8.8.8.8", startupinfo=si
-                ).decode(errors="ignore")
-                if "tempo=" in out:
-                    d["ping"] = out.split("tempo=")[1].split(" ")[0]
-                elif "time=" in out:
-                    d["ping"] = out.split("time=")[1].split(" ")[0]
-                else:
-                    d["ping"] = "999ms"
+                t1 = time.time()
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1)
+                s.connect(("8.8.8.8", 53))
+                s.close()
+                d["ping"] = f"{(time.time() - t1)*1000:.0f}ms"
             except:
                 d["ping"] = "Err"
 
-            # Temp
-            d["temp"] = "--"
-            if HAS_WMI:
+            # BUSCA IP SE AINDA NÃO ACHOU
+            if not self.found_ip:
+                self.found_ip = self.find_monitor_ip()
+
+            # LEITURA DO HARDWARE
+            if self.found_ip:
                 try:
-                    w = wmi.WMI(namespace="root\\wmi")
-                    res = w.MSAcpi_ThermalZoneTemperature()
-                    if res:
-                        d["temp"] = f"{(res[0].CurrentTemperature - 2732)/10:.0f}°C"
+                    r = requests.get(self.found_ip, timeout=0.5)
+                    if r.status_code == 200:
+                        data = r.json()
+                        if "Children" in data:
+                            self.parse_hardware_json(data["Children"], d)
                 except:
-                    pass
+                    self.found_ip = None  # Se falhar, procura de novo no próximo ciclo
+
+            # FALLBACKS FINAIS
+            if d["temp"] == "--" and d["gpu_temp"]:
+                d["temp"] = d["gpu_temp"]
             if d["temp"] == "--":
                 try:
                     d["temp"] = f"{psutil.cpu_freq().current/1000:.1f}GHz"
                 except:
                     pass
 
-            # GPU
-            d["gpu_load"] = 0
-            if HAS_GPU:
-                try:
-                    gpus = GPUtil.getGPUs()
-                    if gpus:
-                        d["gpu_load"] = int(gpus[0].load * 100)
-                except:
-                    pass
-
             self.data_ready.emit(d)
-            for _ in range(10):
-                if not self.running:
-                    break
-                time.sleep(0.2)
+            time.sleep(0.5)
 
     def stop(self):
         self.running = False
         self.wait()
 
 
-# --- WORKER GEOIP (LOOP DE PERSISTÊNCIA) ---
+class GameDetector(QThread):
+    game_found = pyqtSignal(bool)
+
+    def run(self):
+        while True:
+            found = False
+            try:
+                for proc in psutil.process_iter(["name"]):
+                    if proc.info["name"] and proc.info["name"].lower() in GAMES_LIST:
+                        found = True
+                        break
+            except:
+                pass
+            self.game_found.emit(found)
+            time.sleep(3)
+
+
 class GeoWorker(QThread):
     data_ready = pyqtSignal(dict)
 
     def run(self):
-        # Tenta continuamente até conseguir, depois atualiza a cada 5 min
         while True:
-            d = {"ip": "Buscando...", "country": "??"}
+            d = {"ip": "...", "country": "??"}
             apis = [
                 ("https://api.ipify.org?format=json", "ip"),
                 ("http://ip-api.com/json", "query"),
-                ("https://checkip.amazonaws.com", None),  # Amazon volta texto puro
+                ("https://checkip.amazonaws.com", None),
             ]
-
             success = False
             for url, key in apis:
                 try:
-                    r = requests.get(url, timeout=5)
-                    if key is None:  # Caso Amazon (texto puro)
+                    r = requests.get(url, timeout=3)
+                    if key is None:
                         d["ip"] = r.text.strip()
                         d["country"] = "AWS"
-                    else:  # Caso JSON
+                    else:
                         js = r.json()
-                        if key in js:
-                            d["ip"] = js[key]
-                            d["country"] = js.get(
-                                "countryCode", js.get("country", "OK")
-                            )
-
+                        d["ip"] = js.get(key, "Erro")
+                        d["country"] = js.get("countryCode", "OK")
                     success = True
                     self.data_ready.emit(d)
                     break
                 except:
                     continue
-
-            # Se conseguiu, dorme 5 minutos. Se falhou, tenta de novo em 10s
             if success:
                 time.sleep(300)
             else:
@@ -243,7 +351,11 @@ class ConfigHub(QDialog):
         grp_vis.setLayout(l)
         layout.addWidget(grp_vis)
 
-        grp_mods = QGroupBox("Barras (HUD)")
+        self.chk_auto = QCheckBox("Auto-Detectar Jogos")
+        self.chk_auto.setChecked(self.config.get("auto_game", True))
+        layout.addWidget(self.chk_auto)
+
+        grp_mods = QGroupBox("Barras")
         l2 = QVBoxLayout()
         self.chk_hw = QCheckBox("Info Hardware")
         self.chk_hw.setChecked(self.mods.get("show_hardware", True))
@@ -277,6 +389,7 @@ class ConfigHub(QDialog):
             "size": self.sz_spin.value(),
             "game_mode": self.config.get("game_mode", False),
             "theme": self.config.get("theme", "purple"),
+            "auto_game": self.chk_auto.isChecked(),
             "modules": {
                 "show_hardware": self.chk_hw.isChecked(),
                 "show_cpu": self.chk_cpu.isChecked(),
@@ -302,7 +415,6 @@ class ZenithHUD(QDialog):
 
         layout = QVBoxLayout()
         mods = parent.config.get("modules", DEFAULT_CONFIG["modules"])
-
         layout.addWidget(
             QLabel(
                 "GENGAR OS // ULTIMATE",
@@ -325,6 +437,8 @@ class ZenithHUD(QDialog):
             self.add_bar(layout, "RAM:", "bar_ram")
         if mods.get("show_gpu", True):
             self.add_bar(layout, "GPU:", "bar_gpu")
+        self.add_bar(layout, "TEMP:", "bar_temp")
+
         if mods.get("show_disk", True):
             self.add_bar(layout, "Disco:", "bar_disk")
 
@@ -346,7 +460,7 @@ class ZenithHUD(QDialog):
         self.setLayout(layout)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update)
-        self.timer.start(1000)
+        self.timer.start(500)
         self.update()
 
     def add_bar(self, layout, txt, attr):
@@ -365,10 +479,19 @@ class ZenithHUD(QDialog):
             self.bar_disk.setValue(int(psutil.disk_usage("/").percent))
         if hasattr(self, "bar_gpu"):
             self.bar_gpu.setValue(self.parent_ref.game_data.get("gpu_load", 0))
+
+        if hasattr(self, "bar_temp"):
+            temp_str = self.parent_ref.game_data.get("temp", "0")
+            try:
+                temp_val = int(float(temp_str.replace("°C", "").replace("GHz", "0")))
+                self.bar_temp.setValue(temp_val)
+                self.bar_temp.setFormat(f"{temp_val}°C")
+            except:
+                self.bar_temp.setValue(0)
+
         if hasattr(self, "lbl_spd"):
             d, u = self.parent_ref.net_speed
             self.lbl_spd.setText(f"⬇️ {d}  ⬆️ {u}")
-        # Atualiza IP se mudar
         if hasattr(self, "lbl_ip"):
             self.lbl_ip.setText(f"IP: {self.parent_ref.geo_data['ip']}")
 
@@ -402,30 +525,54 @@ class App(QWidget):
         self.mov.start()
         self.lbl.move(0, 0)
 
-        self.overlay = QLabel(self)
-        self.overlay.setStyleSheet(
+        # UI DO MODO JOGO
+        self.overlay_widget = QWidget(self)
+        self.overlay_widget.hide()
+
+        self.ov_layout = QVBoxLayout(self.overlay_widget)
+        self.ov_layout.setContentsMargins(4, 4, 4, 4)
+        self.ov_layout.setSpacing(1)
+
+        self.l_gpu = QLabel("GPU: --")
+        self.l_ping = QLabel("PING: --")
+        self.l_temp = QLabel("TEMP: --")
+        self.l_lat = QLabel("LAT: --")
+
+        font = self.font()
+        font.setFamily("Consolas")
+        font.setPixelSize(10)
+        font.setBold(True)
+
+        for lb in [self.l_gpu, self.l_ping, self.l_temp, self.l_lat]:
+            lb.setFont(font)
+            lb.setStyleSheet("color: #00ff00;")
+            lb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.ov_layout.addWidget(lb)
+
+        self.overlay_widget.setStyleSheet(
             """
-            color: #00ff00; 
-            background-color: rgba(0, 0, 0, 0.4);
-            font-weight: bold; font-family: 'Consolas'; font-size: 9px;
-            border-radius: 4px; padding: 3px;
-            border: 1px solid rgba(0, 255, 0, 0.3);
+            background-color: rgba(0, 0, 0, 0.5);
+            border-radius: 5px;
+            border: 1px solid rgba(0, 255, 0, 0.2);
         """
         )
-        self.overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.overlay.hide()
+        self.overlay_widget.setFixedWidth(80)
 
         self.apply_visuals()
 
-        self.geo_data = {"ip": "Buscando...", "country": ".."}
+        self.geo_data = {"ip": "...", "country": ".."}
         self.geo = GeoWorker()
         self.geo.data_ready.connect(self.set_geo)
         self.geo.start()
 
-        self.game_data = {"ping": "--", "temp": "--", "gpu_load": 0}
-        self.worker = DataWorker()
+        self.game_data = {"ping": "--", "temp": "--", "gpu_load": 0, "gpu_temp": None}
+        self.worker = FastWorker()
         self.worker.data_ready.connect(self.update_data)
         self.worker.start()
+
+        self.detector = GameDetector()
+        self.detector.game_found.connect(self.on_game_detected)
+        self.detector.start()
 
         self.last_net = psutil.net_io_counters()
         self.net_speed = ("0", "0")
@@ -433,7 +580,7 @@ class App(QWidget):
         self.init_tray()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
-        self.timer.start(500)
+        self.timer.start(100)
         self.hud = ZenithHUD(self)
         self.old_pos = None
 
@@ -442,6 +589,15 @@ class App(QWidget):
 
     def update_data(self, d):
         self.game_data = d
+
+    def on_game_detected(self, found):
+        if self.config.get("auto_game", True):
+            if found and not self.config["game_mode"]:
+                self.config["game_mode"] = True
+                self.apply_visuals()
+            elif not found and self.config["game_mode"]:
+                self.config["game_mode"] = False
+                self.apply_visuals()
 
     def init_tray(self):
         self.tray = QSystemTrayIcon(self)
@@ -498,16 +654,22 @@ class App(QWidget):
         if self.config["game_mode"]:
             ping_val = self.game_data.get("ping", "--")
             temp_val = self.game_data.get("temp", "--")
-            self.overlay.setText(
-                f"FPS: --\nPING: {ping_val}\nTEMP: {temp_val}\nLAT: {ping_val}"
-            )
-            self.overlay.adjustSize()
-            x_pos = int((self.width() - self.overlay.width()) / 2)
+            gpu_val = self.game_data.get("gpu_load", 0)
+
+            self.l_gpu.setText(f"GPU: {gpu_val}%")
+            self.l_ping.setText(f"PING: {ping_val}")
+            self.l_temp.setText(f"TEMP: {temp_val}")
+            self.l_lat.setText(f"LAT: {ping_val}")
+
+            color = get_temp_color(temp_val)
+            self.l_temp.setStyleSheet(f"color: {color};")
+
+            x_pos = int((self.width() - self.overlay_widget.width()) / 2)
             y_pos = self.lbl.height() + 5
-            self.overlay.move(x_pos, y_pos)
-            self.overlay.show()
+            self.overlay_widget.move(x_pos, y_pos)
+            self.overlay_widget.show()
         else:
-            self.overlay.hide()
+            self.overlay_widget.hide()
         self.tray.setToolTip(f"Gengar OS: {cpu}% CPU")
 
     def toggle_game(self):
@@ -519,8 +681,8 @@ class App(QWidget):
         current_size = self.config.get("size", 170)
         if self.config["game_mode"]:
             gengar_size = 110
-            window_height = gengar_size + 70
-            op = 0.8
+            window_height = gengar_size + 80
+            op = 0.85
             self.resize(gengar_size, window_height)
             self.lbl.resize(gengar_size, gengar_size)
             self.mov.setScaledSize(QSize(gengar_size, gengar_size))
@@ -562,7 +724,6 @@ class App(QWidget):
             self.old_pos = e.globalPosition().toPoint()
         elif e.button() == Qt.MouseButton.RightButton:
             if not self.config["game_mode"]:
-                # LÓGICA DE TOGGLE (ABRIR/FECHAR)
                 if self.hud.isVisible():
                     self.hud.hide()
                 else:

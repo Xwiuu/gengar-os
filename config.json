@@ -1,1 +1,1 @@
-{"opacity": 1.0, "size": 100, "game_mode": false, "theme": "purple", "modules": {"show_hardware": true, "show_cpu": true, "show_ram": true, "show_gpu": true, "show_disk": true, "show_net": true}}
+{"opacity": 1.0, "size": 100, "game_mode": false, "theme": "purple", "auto_game": true, "modules": {"show_hardware": true, "show_cpu": true, "show_ram": true, "show_gpu": true, "show_disk": true, "show_net": true}}
